@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="{% block description %}Compilação diária de notícias jurídicas — STF, STJ, Conjur e Migalhas, organizadas por área do Direito.{% endblock %}">
+    <title>{% block title %}Jurídico do Dia{% endblock %}</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="site-header">
+        <div class="container header-row">
+            <a href="index.html" class="logo">
+                <span class="logo-mark">§</span>
+                <span class="logo-text">Jurídico do Dia</span>
+            </a>
+            <nav class="main-nav">
+                {% for a in (all_areas if all_areas is defined else areas) %}
+                <a href="{{ a.id }}.html"{% if area is defined and area.id == a.id %} class="active"{% endif %}>{{ a.name }}</a>
+                {% endfor %}
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p class="footer-meta">
+                Atualizado em <strong>{{ updated_at | full_date }}</strong> ·
+                Janela: últimos {{ window_days }} dias ·
+                Fontes:
+                {% for s in sources %}{{ s.short }}{% if not loop.last %} · {% endif %}{% endfor %}
+            </p>
+            <p class="disclaimer">
+                Este site agrega títulos e links de notícias publicadas em fontes públicas.
+                Os conteúdos são propriedade dos respectivos veículos. Clique nos títulos para ler na fonte original.
+                A classificação por área é automática e pode conter imprecisões.
+            </p>
+        </div>
+    </footer>
+</body>
+</html>

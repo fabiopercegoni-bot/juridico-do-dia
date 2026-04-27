@@ -1,0 +1,52 @@
+{
+  "sources": [
+    {
+      "id": "conjur",
+      "name": "Consultor Jurídico",
+      "short": "Conjur",
+      "url": "https://www.conjur.com.br/rss.xml"
+    },
+    {
+      "id": "stf",
+      "name": "Supremo Tribunal Federal",
+      "short": "STF",
+      "url": "https://news.google.com/rss/search?q=site:stf.jus.br+(julgamento+OR+decisão+OR+acórdão+OR+ministro)&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "stj",
+      "name": "Superior Tribunal de Justiça",
+      "short": "STJ",
+      "url": "https://news.google.com/rss/search?q=site:stj.jus.br+(julgamento+OR+decisão+OR+acórdão+OR+ministro)&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "migalhas",
+      "name": "Migalhas",
+      "short": "Migalhas",
+      "url": "https://news.google.com/rss/search?q=site:migalhas.com.br&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "valor",
+      "name": "Valor Econômico",
+      "short": "Valor",
+      "url": "https://news.google.com/rss/search?q=site:valor.globo.com+(jurídico+OR+julgamento+OR+STF+OR+STJ+OR+CARF+OR+tributário+OR+societário+OR+fusão+OR+aquisição+OR+legislação)&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "pinheiro_neto",
+      "name": "Pinheiro Neto Advogados",
+      "short": "Pinheiro Neto",
+      "url": "https://news.google.com/rss/search?q=site:pinheironeto.com.br&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "mattos_filho",
+      "name": "Mattos Filho",
+      "short": "Mattos Filho",
+      "url": "https://www.mattosfilho.com.br/feed/"
+    },
+    {
+      "id": "bvz",
+      "name": "BVZ Advogados",
+      "short": "BVZ",
+      "url": "https://bvzadvogados.com.br/feed/"
+    }
+  ]
+}

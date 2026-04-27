@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Jurídico do Dia · {{ today_long }}{% endblock %}
+{% block content %}
+<section class="hero">
+    <div class="container">
+        <p class="kicker">Edição de {{ today_long }}</p>
+        <h1>Notícias jurídicas, organizadas por área do Direito.</h1>
+        <p class="lede">
+            Compilação diária dos principais julgados, decisões e movimentações dos tribunais superiores e da imprensa jurídica.
+            Escolha a área para ver as notícias do dia.
+        </p>
+    </div>
+</section>
+
+<section class="container areas-section">
+    <div class="areas-grid">
+        {% for area in areas %}
+        <a href="{{ area.id }}.html" class="area-card">
+            <div class="area-card-head">
+                <h2>{{ area.name }}</h2>
+                <span class="area-card-arrow" aria-hidden="true">→</span>
+            </div>
+            <p class="area-card-desc">{{ area.description }}</p>
+            <div class="area-card-counts">
+                {% if area.today > 0 %}
+                <span class="badge badge-fresh">
+                    <strong>{{ area.today }}</strong>
+                    {% if area.today == 1 %}nova hoje{% else %}novas hoje{% endif %}
+                </span>
+                {% else %}
+                <span class="badge badge-empty">Sem novidades hoje</span>
+                {% endif %}
+                <span class="counts-week">{{ area.total }} na semana</span>
+            </div>
+        </a>
+        {% endfor %}
+    </div>
+</section>
+
+<section class="container sources-section">
+    <h3 class="section-label">Fontes consultadas</h3>
+    <ul class="sources-list">
+        {% for s in sources %}
+        <li><span class="source-pill source-{{ s.id }}">{{ s.short }}</span> {{ s.name }}</li>
+        {% endfor %}
+    </ul>
+</section>
+{% endblock %}

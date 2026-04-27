@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ area.name }} · Jurídico do Dia{% endblock %}
+{% block description %}Notícias recentes em Direito {{ area.name }}: {{ area.description }}{% endblock %}
+{% block content %}
+<section class="container area-page">
+    <nav class="breadcrumb" aria-label="Trilha de navegação">
+        <a href="index.html">Início</a>
+        <span class="sep">/</span>
+        <span class="current">{{ area.name }}</span>
+    </nav>
+
+    <header class="area-header">
+        <p class="kicker">Direito · {{ updated_at | long_date }}</p>
+        <h1>{{ area.name }}</h1>
+        <p class="lede">{{ area.description }}</p>
+    </header>
+
+    {% if items %}
+    <div class="news-list">
+        {% set ns = namespace(current_bucket=None) %}
+        {% for item in items %}
+            {% set bucket = item.published | relative_date %}
+            {% if bucket != ns.current_bucket %}
+                {% if not loop.first %}
+                </ul>
+                {% endif %}
+                <h2 class="date-bucket">{{ bucket }}</h2>
+                <ul class="items">
+                {% set ns.current_bucket = bucket %}
+            {% endif %}
+            <li class="news-item">
+                <div class="news-item-head">
+                    <span class="source-pill source-{{ item.source_id }}">{{ item.source_short }}</span>
+                    <time class="news-item-date">{{ item.published | full_date }}</time>
+                </div>
+                <a href="{{ item.link }}" target="_blank" rel="noopener noreferrer" class="news-item-title">{{ item.title }}</a>
+                {% if item.description %}
+                <p class="news-item-summary">{{ item.description }}</p>
+                {% endif %}
+            </li>
+            {% if loop.last %}
+                </ul>
+            {% endif %}
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>Nenhuma notícia recente classificada nesta área nos últimos {{ window_days }} dias.</p>
+        <p class="empty-state-hint">A classificação é automática por palavras-chave. Volte amanhã ou explore outras áreas.</p>
+    </div>
+    {% endif %}
+
+    <nav class="other-areas">
+        <p class="section-label">Outras áreas</p>
+        <ul>
+            {% for a in all_areas %}
+                {% if a.id != area.id %}
+                <li><a href="{{ a.id }}.html"><strong>{{ a.name }}</strong> <span class="muted">{{ a.total }} na semana</span></a></li>
+                {% endif %}
+            {% endfor %}
+        </ul>
+    </nav>
+</section>
+{% endblock %}
