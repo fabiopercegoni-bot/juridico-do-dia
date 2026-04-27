@@ -1,0 +1,945 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+docs/
+
+"""Build the legal news aggregator static site.
+
+Reads feeds from feeds.json, classifies items by area using keywords.json,
+and renders HTML pages into docs/ for GitHub Pages.
+"""
+
+import html
+import json
+import re
+import shutil
+import sys
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import feedparser
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+ROOT = Path(__file__).resolve().parent
+OUTPUT_DIR = ROOT / "docs"
+TEMPLATES_DIR = ROOT / "templates"
+STATIC_DIR = ROOT / "static"
+
+WINDOW_DAYS = 7
+MIN_SCORE = 1
+USER_AGENT = "Mozilla/5.0 (compatible; JuridicoDoDia/1.0; +https://github.com/)"
+
+MONTHS_PT = [
+    "", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+]
+
+BR_TZ = timezone(timedelta(hours=-3))
+
+
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return text.lower()
+
+
+def strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    # Strip WordPress-style RSS boilerplate ("O post X apareceu primeiro em Y")
+    text = re.sub(r"\[?\.{2,}\]?\s*O\s+post\s+.+$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"O\s+post\s+.+\s+(apareceu primeiro em|foi publicado primeiro em).+$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def is_redundant_description(title: str, description: str) -> bool:
+    """True when the description is just a repeat of the title (common in
+    Google News feeds where summary == title + source name)."""
+    if not description:
+        return True
+    t = normalize(title)
+    d = normalize(description)
+    # Identical, or description is a prefix of title (or vice versa)
+    if t == d or d.startswith(t) or t.startswith(d):
+        return True
+    # Description is mostly the title (>80% overlap)
+    if len(d) < len(t) * 1.3 and t[:60] in d:
+        return True
+    return False
+
+
+def clean_gnews_title(title: str) -> str:
+    """Google News appends ' - Source Name' to every title. Strip it for cleaner display."""
+    # Common patterns: " - Migalhas", " - stf noticias", " - Superior Tribunal de Justiça"
+    return re.sub(r"\s+-\s+[^-]{2,60}$", "", title).strip()
+
+
+def truncate(text: str, limit: int = 360) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1].rsplit(" ", 1)[0]
+    return cut + "…"
+
+
+def load_config():
+    feeds = json.loads((ROOT / "feeds.json").read_text(encoding="utf-8"))
+    keywords = json.loads((ROOT / "keywords.json").read_text(encoding="utf-8"))
+    return feeds["sources"], keywords["areas"]
+
+
+def fetch_feed(source: dict) -> list[dict]:
+    parsed = feedparser.parse(source["url"], agent=USER_AGENT)
+    if parsed.bozo and not parsed.entries:
+        raise RuntimeError(f"feedparser error: {parsed.bozo_exception}")
+
+    items = []
+    for entry in parsed.entries:
+        published = None
+        for key in ("published_parsed", "updated_parsed"):
+            tm = entry.get(key)
+            if tm:
+                published = datetime(*tm[:6], tzinfo=timezone.utc)
+                break
+        if not published:
+            continue
+
+        raw_title = (entry.get("title") or "").strip()
+        if not raw_title:
+            continue
+        raw_title = re.sub(r"\s+", " ", raw_title)
+        title = clean_gnews_title(raw_title)
+
+        link = entry.get("link") or ""
+        description = truncate(strip_html(entry.get("summary", "")))
+        if is_redundant_description(title, description):
+            description = ""
+
+        items.append({
+            "title": title,
+            "link": link,
+            "description": description,
+            "published": published,
+            "source_id": source["id"],
+            "source_short": source["short"],
+            "source_name": source["name"],
+        })
+    return items
+
+
+def score_item(item: dict, area: dict) -> tuple[int, list[str]]:
+    """Score how well an item matches an area.
+
+    Strong keywords add 3 points, regular keywords add 1.
+    Duplicates that normalize to the same form (e.g. "ICMS" and "icms",
+    or "tributário" and "tributario") are counted only once, avoiding
+    inflated scores from accented/unaccented variants in keywords.json.
+    """
+    text = normalize(item["title"] + " " + item["description"])
+    score = 0
+    matched: list[str] = []
+    seen: set[str] = set()
+    for kw in area.get("strong_keywords", []):
+        kw_norm = normalize(kw)
+        if kw_norm in seen:
+            continue
+        seen.add(kw_norm)
+        pattern = r"(?:^|[^a-z0-9])" + re.escape(kw_norm) + r"(?:$|[^a-z0-9])"
+        if re.search(pattern, text):
+            score += 3
+            matched.append(kw)
+    for kw in area.get("keywords", []):
+        kw_norm = normalize(kw)
+        if kw_norm in seen:
+            continue
+        seen.add(kw_norm)
+        pattern = r"(?:^|[^a-z0-9])" + re.escape(kw_norm) + r"(?:$|[^a-z0-9])"
+        if re.search(pattern, text):
+            score += 1
+            matched.append(kw)
+    return score, matched
+
+
+def classify(items: list[dict], areas: list[dict]) -> dict[str, list[dict]]:
+    by_area: dict[str, list[dict]] = {a["id"]: [] for a in areas}
+    for item in items:
+        best_id = None
+        best_score = MIN_SCORE - 1
+        for area in areas:
+            score, matched = score_item(item, area)
+            if score > best_score:
+                best_score = score
+                best_id = area["id"]
+                item["_matched"] = matched
+        if best_id:
+            item["score"] = best_score
+            by_area[best_id].append(item)
+    return by_area
+
+
+def dedupe(items: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+    for item in items:
+        key = normalize(item["title"])[:90]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def relative_date_pt(dt: datetime, now: datetime) -> str:
+    dt_local = dt.astimezone(BR_TZ).date()
+    now_local = now.astimezone(BR_TZ).date()
+    delta = (now_local - dt_local).days
+    if delta == 0:
+        return "Hoje"
+    if delta == 1:
+        return "Ontem"
+    if delta < 7:
+        return f"Há {delta} dias"
+    return f"{dt_local.day}/{dt_local.month:02d}/{dt_local.year}"
+
+
+def formatted_date_pt(dt: datetime) -> str:
+    dt_local = dt.astimezone(BR_TZ)
+    return f"{dt_local.day:02d}/{dt_local.month:02d}/{dt_local.year} · {dt_local.strftime('%H:%M')}"
+
+
+def long_date_pt(dt: datetime) -> str:
+    dt_local = dt.astimezone(BR_TZ)
+    return f"{dt_local.day} de {MONTHS_PT[dt_local.month]} de {dt_local.year}"
+
+
+def main() -> int:
+    sources, areas = load_config()
+    print(f"[1/4] Fetching {len(sources)} sources...")
+    all_items: list[dict] = []
+    for source in sources:
+        try:
+            items = fetch_feed(source)
+            print(f"      {source['short']:<10} {len(items):>3} items")
+            all_items.extend(items)
+        except Exception as exc:
+            print(f"      {source['short']:<10} ERROR: {exc}", file=sys.stderr)
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=WINDOW_DAYS)
+
+    print(f"[2/4] Filtering to last {WINDOW_DAYS} days...")
+    recent = [i for i in all_items if i["published"] >= cutoff]
+    recent = dedupe(recent)
+    print(f"      {len(recent)} items after dedup")
+
+    print(f"[3/4] Classifying into {len(areas)} areas...")
+    by_area = classify(recent, areas)
+    for area in areas:
+        items = by_area[area["id"]]
+        items.sort(key=lambda i: i["published"], reverse=True)
+        print(f"      {area['name']:<22} {len(items):>3} items")
+
+    print("[4/4] Rendering HTML...")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if STATIC_DIR.exists():
+        for src in STATIC_DIR.iterdir():
+            shutil.copy(src, OUTPUT_DIR / src.name)
+
+    env = Environment(
+        loader=FileSystemLoader(str(TEMPLATES_DIR)),
+        autoescape=select_autoescape(["html"]),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    env.filters["relative_date"] = lambda dt: relative_date_pt(dt, now)
+    env.filters["full_date"] = formatted_date_pt
+    env.filters["long_date"] = long_date_pt
+
+    area_summary = []
+    for area in areas:
+        items = by_area[area["id"]]
+        today_count = sum(
+            1 for i in items
+            if i["published"].astimezone(BR_TZ).date() == now.astimezone(BR_TZ).date()
+        )
+        area_summary.append({
+            "id": area["id"],
+            "name": area["name"],
+            "description": area["description"],
+            "total": len(items),
+            "today": today_count,
+        })
+
+    common = {
+        "updated_at": now,
+        "today_long": long_date_pt(now),
+        "sources": sources,
+        "window_days": WINDOW_DAYS,
+    }
+
+    index_html = env.get_template("index.html").render(
+        areas=area_summary,
+        **common,
+    )
+    (OUTPUT_DIR / "index.html").write_text(index_html, encoding="utf-8")
+
+    for area in areas:
+        html = env.get_template("area.html").render(
+            area=area,
+            items=by_area[area["id"]],
+            all_areas=area_summary,
+            **common,
+        )
+        (OUTPUT_DIR / f"{area['id']}.html").write_text(html, encoding="utf-8")
+
+    print(f"\nDone. Site generated in {OUTPUT_DIR.relative_to(ROOT)}/")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+{
+  "sources": [
+    {
+      "id": "conjur",
+      "name": "Consultor Jurídico",
+      "short": "Conjur",
+      "url": "https://www.conjur.com.br/rss.xml"
+    },
+    {
+      "id": "stf",
+      "name": "Supremo Tribunal Federal",
+      "short": "STF",
+      "url": "https://news.google.com/rss/search?q=site:stf.jus.br+(julgamento+OR+decisão+OR+acórdão+OR+ministro)&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "stj",
+      "name": "Superior Tribunal de Justiça",
+      "short": "STJ",
+      "url": "https://news.google.com/rss/search?q=site:stj.jus.br+(julgamento+OR+decisão+OR+acórdão+OR+ministro)&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "migalhas",
+      "name": "Migalhas",
+      "short": "Migalhas",
+      "url": "https://news.google.com/rss/search?q=site:migalhas.com.br&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "valor",
+      "name": "Valor Econômico",
+      "short": "Valor",
+      "url": "https://news.google.com/rss/search?q=site:valor.globo.com+(jurídico+OR+julgamento+OR+STF+OR+STJ+OR+CARF+OR+tributário+OR+societário+OR+fusão+OR+aquisição+OR+legislação)&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "pinheiro_neto",
+      "name": "Pinheiro Neto Advogados",
+      "short": "Pinheiro Neto",
+      "url": "https://news.google.com/rss/search?q=site:pinheironeto.com.br&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    },
+    {
+      "id": "mattos_filho",
+      "name": "Mattos Filho",
+      "short": "Mattos Filho",
+      "url": "https://www.mattosfilho.com.br/feed/"
+    },
+    {
+      "id": "bvz",
+      "name": "BVZ Advogados",
+      "short": "BVZ",
+      "url": "https://bvzadvogados.com.br/feed/"
+    }
+  ]
+}
+
+{
+  "areas": [
+    {
+      "id": "societario",
+      "name": "Societário",
+      "description": "Empresas, sócios, M&A, governança corporativa, recuperação judicial e mercado de capitais.",
+      "strong_keywords": [
+        "sociedade anônima",
+        "sociedade anonima",
+        "lei das s.a.",
+        "lei das sa",
+        "governança corporativa",
+        "governanca corporativa",
+        "mercado de capitais",
+        "exclusão de sócio",
+        "exclusao de socio",
+        "dissolução parcial",
+        "dissolucao parcial",
+        "acordo de acionistas",
+        "acordo de quotistas",
+        "fusão e aquisição",
+        "fusao e aquisicao",
+        "deveres fiduciários",
+        "deveres fiduciarios",
+        "responsabilidade dos administradores",
+        "comissão de valores mobiliários",
+        "comissao de valores mobiliarios",
+        "recuperação judicial",
+        "recuperacao judicial",
+        "recuperação extrajudicial",
+        "recuperacao extrajudicial",
+        "falência",
+        "falencia",
+        "oferta pública de aquisição",
+        "oferta publica de aquisicao"
+      ],
+      "keywords": [
+        "sociedade",
+        "sócio",
+        "socio",
+        "sócios",
+        "socios",
+        "acionista",
+        "acionistas",
+        "quotista",
+        "quotistas",
+        "ltda",
+        "limitada",
+        "empresarial",
+        "empresário",
+        "empresario",
+        "holding",
+        "subsidiária",
+        "subsidiaria",
+        "minoritário",
+        "minoritario",
+        "controlador",
+        "conselho de administração",
+        "conselho de administracao",
+        "diretoria",
+        "capital social",
+        "incorporação societária",
+        "incorporacao societaria",
+        "fusão",
+        "fusao",
+        "joint venture",
+        "drag along",
+        "tag along",
+        "valuation",
+        "cvm",
+        "b3",
+        "bolsa de valores",
+        "debênture",
+        "debenture",
+        "opa",
+        "m&a",
+        "due diligence",
+        "ipo"
+      ]
+    },
+    {
+      "id": "familia",
+      "name": "Família e Sucessões",
+      "description": "Casamento, divórcio, guarda, alimentos, inventário e herança.",
+      "strong_keywords": [
+        "alienação parental",
+        "alienacao parental",
+        "guarda compartilhada",
+        "pensão alimentícia",
+        "pensao alimenticia",
+        "união estável",
+        "uniao estavel",
+        "regime de bens",
+        "comunhão parcial",
+        "comunhao parcial",
+        "comunhão universal",
+        "comunhao universal",
+        "separação obrigatória",
+        "separacao obrigatoria",
+        "filiação socioafetiva",
+        "filiacao socioafetiva",
+        "investigação de paternidade",
+        "investigacao de paternidade",
+        "lei maria da penha",
+        "violência doméstica",
+        "violencia domestica",
+        "estatuto da criança",
+        "estatuto da crianca"
+      ],
+      "keywords": [
+        "família",
+        "familia",
+        "familiar",
+        "casamento",
+        "divórcio",
+        "divorcio",
+        "alimentos",
+        "guarda",
+        "visitas",
+        "adoção de criança",
+        "adocao de crianca",
+        "filiação",
+        "filiacao",
+        "paternidade",
+        "maternidade",
+        "sucessão hereditária",
+        "sucessao hereditaria",
+        "herança",
+        "heranca",
+        "herdeiro",
+        "cônjuge",
+        "conjuge",
+        "companheiro",
+        "convivente",
+        "meação",
+        "meacao",
+        "inventário",
+        "inventario",
+        "testamento",
+        "partilha de bens",
+        "criança e adolescente",
+        "crianca e adolescente",
+        "abandono afetivo",
+        "afetiva",
+        "casal homoafetivo"
+      ]
+    },
+    {
+      "id": "civel",
+      "name": "Cível",
+      "description": "Contratos, responsabilidade civil, consumidor, posse e propriedade.",
+      "strong_keywords": [
+        "responsabilidade civil",
+        "dano moral",
+        "danos morais",
+        "dano material",
+        "danos materiais",
+        "código de defesa do consumidor",
+        "codigo de defesa do consumidor",
+        "código civil",
+        "codigo civil",
+        "lucros cessantes",
+        "danos emergentes",
+        "ação de cobrança",
+        "acao de cobranca",
+        "execução de título",
+        "execucao de titulo",
+        "boa-fé objetiva",
+        "boa-fe objetiva",
+        "função social do contrato",
+        "funcao social do contrato",
+        "negativação indevida",
+        "negativacao indevida",
+        "superendividamento",
+        "relação de consumo",
+        "relacao de consumo",
+        "vício do produto",
+        "vicio do produto"
+      ],
+      "keywords": [
+        "contrato",
+        "contratos",
+        "indenização",
+        "indenizacao",
+        "cível",
+        "civel",
+        "consumidor",
+        "fornecedor",
+        "defeito do produto",
+        "condomínio",
+        "condominio",
+        "locação",
+        "locacao",
+        "aluguel",
+        "inquilino",
+        "locatário",
+        "locatario",
+        "locador",
+        "propriedade",
+        "posse",
+        "imóvel",
+        "imovel",
+        "imobiliário",
+        "imobiliario",
+        "usucapião",
+        "usucapiao",
+        "obrigações civis",
+        "obrigacoes civis",
+        "mora",
+        "juros remuneratórios",
+        "juros remuneratorios",
+        "correção monetária",
+        "correcao monetaria",
+        "prescrição civil",
+        "prescricao civil",
+        "decadência",
+        "decadencia",
+        "plano de saúde",
+        "plano de saude"
+      ]
+    },
+    {
+      "id": "tributario",
+      "name": "Tributário",
+      "description": "Impostos, contribuições, contencioso fiscal e planejamento tributário.",
+      "strong_keywords": [
+        "icms",
+        "iss",
+        "ipi",
+        "irpj",
+        "irpf",
+        "pis/cofins",
+        "pis e cofins",
+        "iptu",
+        "ipva",
+        "itcmd",
+        "itbi",
+        "itr",
+        "receita federal",
+        "fazenda nacional",
+        "carf",
+        "execução fiscal",
+        "execucao fiscal",
+        "exclusão do icms",
+        "exclusao do icms",
+        "tese do século",
+        "tese do seculo",
+        "contribuição previdenciária",
+        "contribuicao previdenciaria",
+        "modulação de efeitos",
+        "modulacao de efeitos",
+        "repetição de indébito",
+        "repeticao de indebito",
+        "substituição tributária",
+        "substituicao tributaria",
+        "denúncia espontânea",
+        "denuncia espontanea",
+        "compensação tributária",
+        "compensacao tributaria"
+      ],
+      "keywords": [
+        "tributário",
+        "tributaria",
+        "tributario",
+        "tributo",
+        "tributos",
+        "imposto",
+        "impostos",
+        "contribuição",
+        "contribuicao",
+        "contribuinte",
+        "contribuintes",
+        "fisco",
+        "fazenda pública",
+        "fazenda publica",
+        "alíquota",
+        "aliquota",
+        "base de cálculo",
+        "base de calculo",
+        "lançamento tributário",
+        "lancamento tributario",
+        "crédito tributário",
+        "credito tributario",
+        "imunidade tributária",
+        "imunidade tributaria",
+        "isenção fiscal",
+        "isencao fiscal",
+        "incentivo fiscal",
+        "difal",
+        "simples nacional",
+        "lucro real",
+        "lucro presumido",
+        "pis",
+        "cofins",
+        "csll",
+        "iof"
+      ]
+    },
+    {
+      "id": "penal",
+      "name": "Penal",
+      "description": "Crimes, processo penal, execução penal e medidas cautelares.",
+      "strong_keywords": [
+        "código penal",
+        "codigo penal",
+        "código de processo penal",
+        "codigo de processo penal",
+        "lei de drogas",
+        "lei antidrogas",
+        "lavagem de dinheiro",
+        "lavagem de capitais",
+        "tráfico de drogas",
+        "trafico de drogas",
+        "tráfico de influência",
+        "trafico de influencia",
+        "organização criminosa",
+        "organizacao criminosa",
+        "homicídio",
+        "homicidio",
+        "feminicídio",
+        "feminicidio",
+        "estelionato",
+        "delação premiada",
+        "delacao premiada",
+        "colaboração premiada",
+        "colaboracao premiada",
+        "tribunal do júri",
+        "tribunal do juri",
+        "habeas corpus",
+        "prisão preventiva",
+        "prisao preventiva",
+        "prisão temporária",
+        "prisao temporaria",
+        "prisão domiciliar",
+        "prisao domiciliar",
+        "execução penal",
+        "execucao penal",
+        "lei de execução penal",
+        "lei de execucao penal",
+        "progressão de regime",
+        "progressao de regime",
+        "lei anticorrupção",
+        "lei anticorrupcao",
+        "operação lava jato",
+        "operacao lava jato",
+        "ação penal",
+        "acao penal",
+        "denúncia criminal",
+        "denuncia criminal"
+      ],
+      "keywords": [
+        "penal",
+        "criminal",
+        "crime",
+        "crimes",
+        "criminoso",
+        "criminosos",
+        "réu",
+        "reu",
+        "réus",
+        "reus",
+        "delegado",
+        "delegada",
+        "promotor",
+        "promotora",
+        "promotoria",
+        "ministério público",
+        "ministerio publico",
+        "mpf",
+        "polícia federal",
+        "policia federal",
+        "polícia civil",
+        "policia civil",
+        "inquérito policial",
+        "inquerito policial",
+        "absolvição",
+        "absolvicao",
+        "condenação criminal",
+        "condenacao criminal",
+        "júri",
+        "juri",
+        "fiança",
+        "fianca",
+        "extradição",
+        "extradicao",
+        "delito",
+        "estupro",
+        "roubo",
+        "furto",
+        "corrupção passiva",
+        "corrupcao passiva",
+        "corrupção ativa",
+        "corrupcao ativa",
+        "peculato",
+        "indiciado",
+        "denunciado"
+      ]
+    },
+    {
+      "id": "regulatorio",
+      "name": "Regulatório",
+      "description": "Agências reguladoras, concessões, marcos regulatórios e setores regulados.",
+      "strong_keywords": [
+        "agência reguladora",
+        "agencia reguladora",
+        "agências reguladoras",
+        "agencias reguladoras",
+        "anatel",
+        "aneel",
+        "ans",
+        "anvisa",
+        "anac",
+        "antt",
+        "antaq",
+        "ancine",
+        "anm",
+        "bacen",
+        "banco central",
+        "marco regulatório",
+        "marco regulatorio",
+        "marco do saneamento",
+        "consulta pública",
+        "consulta publica",
+        "tomada de subsídios",
+        "tomada de subsidios",
+        "parceria público-privada",
+        "parceria publico-privada",
+        "concessão pública",
+        "concessao publica",
+        "compliance regulatório",
+        "compliance regulatorio",
+        "lei das estatais",
+        "lei geral das agências",
+        "lei geral das agencias",
+        "saúde suplementar",
+        "saude suplementar"
+      ],
+      "keywords": [
+        "regulatório",
+        "regulatoria",
+        "regulatorio",
+        "regulação",
+        "regulacao",
+        "regulamentação",
+        "regulamentacao",
+        "regulado",
+        "regulada",
+        "regulamento técnico",
+        "regulamento tecnico",
+        "concessionária",
+        "concessionaria",
+        "outorga",
+        "fiscalização administrativa",
+        "fiscalizacao administrativa",
+        "ppp",
+        "telecom",
+        "telecomunicações",
+        "telecomunicacoes",
+        "energia elétrica",
+        "energia eletrica",
+        "saneamento básico",
+        "saneamento basico",
+        "tarifa pública",
+        "tarifa publica",
+        "estatal",
+        "privatização",
+        "privatizacao",
+        "leilão de concessão",
+        "leilao de concessao"
+      ]
+    }
+  ]
+}
+
+# Jurídico do Dia
+
+Site estático que compila notícias jurídicas dos tribunais superiores (STF, STJ) e dos principais veículos de imprensa especializada (Conjur, Migalhas), classificadas automaticamente por área do Direito: **Societário**, **Família e Sucessões**, **Cível** e **Tributário**.
+
+Atualização diária via GitHub Actions, hospedagem gratuita no GitHub Pages.
+
+---
+
+## Como funciona
+
+1. Um script Python (`build.py`) lê os feeds RSS configurados em `feeds.json`.
+2. Cada notícia recebe uma pontuação para cada área do Direito com base em palavras-chave (`keywords.json`).
+3. A área com maior pontuação "fica com" a notícia. Itens sem pontuação suficiente são descartados.
+4. O script gera HTML estático em `docs/` — uma página inicial com cards e uma página por área.
+5. O GitHub Actions roda esse processo todo dia às 09h (horário de Brasília) e publica no GitHub Pages.
+
+## Estrutura do projeto
+
+```
+.
+├── build.py                       # Script principal (fetch + classify + render)
+├── feeds.json                     # Fontes (RSS URLs)
+├── keywords.json                  # Palavras-chave por área (editável)
+├── requirements.txt               # Dependências Python
+├── templates/
+│   ├── base.html                  # Layout comum
+│   ├── index.html                 # Página inicial
+│   └── area.html                  # Página por área
+├── static/
+│   └── style.css                  # Estilos
+├── .github/workflows/update.yml   # Automação diária
+└── docs/                          # Saída gerada (não versionada)
+```
+
+## Deploy no GitHub Pages
+
+1. **Criar repositório** no GitHub (público ou privado — Pages funciona em ambos com conta paga; em conta gratuita, precisa ser público).
+2. **Subir os arquivos:**
+   ```bash
+   git init
+   git add .
+   git commit -m "Versão inicial"
+   git branch -M main
+   git remote add origin https://github.com/SEU-USUARIO/SEU-REPO.git
+   git push -u origin main
+   ```
+3. **Habilitar Pages:** no repositório, vá em **Settings → Pages** e em **Source** selecione **GitHub Actions**.
+4. **Pronto.** O workflow rodará no primeiro push e a partir daí todo dia às 09h (Brasília). O site ficará em `https://SEU-USUARIO.github.io/SEU-REPO/`.
+
+Para forçar uma atualização manual: aba **Actions → Atualizar notícias diárias → Run workflow**.
+
+## Rodar localmente (opcional)
+
+Requer Python 3.10+:
+
+```bash
+pip install -r requirements.txt
+python build.py
+# Abra docs/index.html no navegador
+```
+
+## Personalização
+
+### Refinar a classificação
+
+Edite `keywords.json`. Cada área tem dois grupos:
+
+- `strong_keywords` — termos com peso **3** (sinal forte da área)
+- `keywords` — termos com peso **1** (sinal moderado)
+
+A pontuação mínima para uma notícia ser incluída é **2** (configurável em `build.py:MIN_SCORE`). Se uma notícia se encaixar em mais de uma área, vai para a de maior pontuação.
+
+**Dica:** se notícias estão indo para a área errada, adicione termos discriminantes ao `strong_keywords` da área correta, ou termos do "ruído" como `strong_keywords` da área que está absorvendo indevidamente.
+
+### Adicionar/remover áreas
+
+Edite `keywords.json` adicionando uma nova entrada com `id`, `name`, `description`, `strong_keywords` e `keywords`. O site será regenerado automaticamente com a nova área. Não esqueça de garantir que o `id` seja um nome de arquivo válido (sem espaços, sem acentos).
+
+### Mudar fontes
+
+Edite `feeds.json`. Para fontes que não têm RSS público (caso de muitos sites de escritório), use Google News como intermediário:
+
+```json
+{
+  "id": "escritorio-x",
+  "name": "Escritório X",
+  "short": "EscritórioX",
+  "url": "https://news.google.com/rss/search?q=site:escritoriox.com.br&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+}
+```
+
+Não esqueça de adicionar uma classe CSS correspondente em `static/style.css` (`.source-escritorio-x`) se quiser cor própria no badge.
+
+### Mudar o horário da atualização
+
+Edite o `cron` em `.github/workflows/update.yml`. O horário é UTC. Brasília = UTC-3, então `0 12 * * *` = 09h Brasília.
+
+## Limitações conhecidas
+
+- **JOTA** não está incluído — o site não disponibiliza feed RSS público estável.
+- **Links via Google News:** STF, STJ e Migalhas são acessados via Google News RSS (porque seus feeds próprios estão protegidos ou indisponíveis). Os links abrem o artigo original, mas passam por um redirect do Google.
+- **Classificação por palavras-chave** acerta cerca de 80–85% dos casos. Notícias de fronteira (ex: "ICMS sobre prestação de serviço cível em sociedade limitada") podem ir para a área "errada" pelo critério de maior pontuação.
+- **Cobertura limitada ao que está nos feeds.** Geralmente são os destaques de cada veículo, não todo o conteúdo.
+
+## Licença e responsabilidade
+
+Este projeto agrega **títulos, descrições curtas e links** de fontes públicas — não reproduz o conteúdo integral. Os artigos são propriedade de seus respectivos veículos. O usuário é direcionado ao site de origem para ler a matéria completa.
+
+A classificação automática é uma ferramenta de organização, não uma análise jurídica. Não constitui aconselhamento legal.
+
+feedparser>=6.0.10
+jinja2>=3.1.3
